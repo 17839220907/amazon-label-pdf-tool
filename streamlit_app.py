@@ -1121,11 +1121,6 @@ def main():
     st.set_page_config(page_title="亚马逊标签 PDF 飞书上传工具", layout="wide")
     st.title("亚马逊标签 PDF 飞书上传工具")
 
-    with st.sidebar:
-        st.subheader("飞书设置")
-        st.caption("索引表和目标文件夹从 Streamlit Secrets 读取。")
-        delete_existing_same_fnsku = st.checkbox("飞书已有同 FNSKU 时覆盖旧文件", value=True)
-
     pdf_files = st.file_uploader(
         "上传标签 PDF（可多选，也支持一个文件里有多页标签）",
         type=["pdf"],
@@ -1136,7 +1131,7 @@ def main():
     if st.button("开始处理并上传飞书", type="primary", disabled=not can_process, use_container_width=True):
         try:
             with st.spinner("处理中，请不要关闭页面..."):
-                st.session_state["last_result"] = process_uploads(pdf_files, delete_existing_same_fnsku)
+                st.session_state["last_result"] = process_uploads(pdf_files, delete_existing_same_fnsku=True)
         except FatalError as exc:
             st.error(f"启动失败：{exc}")
             st.session_state.pop("last_result", None)

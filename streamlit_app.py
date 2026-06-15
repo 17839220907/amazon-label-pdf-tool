@@ -43,7 +43,7 @@ PROCESS_HISTORY_DIR = Path(os.environ.get("LABEL_TOOL_HISTORY_DIR", "/tmp/amazon
 PROCESS_HISTORY_LIMIT = 3
 JOB_DIR = Path(os.environ.get("LABEL_TOOL_JOB_DIR", "/tmp/amazon_label_pdf_jobs"))
 JOB_HISTORY_LIMIT = 10
-UPLOAD_WORKERS = max(1, int(os.environ.get("LABEL_TOOL_UPLOAD_WORKERS", "5")))
+UPLOAD_WORKERS = max(1, int(os.environ.get("LABEL_TOOL_UPLOAD_WORKERS", "1")))
 FEISHU_REQUEST_TIMEOUT = max(5, int(os.environ.get("LABEL_TOOL_FEISHU_TIMEOUT", "45")))
 
 LOCAL_ILLEGAL_FILENAME_CHARS = r'\/:*?"<>|'
@@ -1664,6 +1664,21 @@ def request_job_cancel(job_dir):
     )
 
 
+def clear_finished_job_history():
+    if not JOB_DIR.exists():
+        return 0
+
+    removed_count = 0
+    active_statuses = {"排队中", "处理中", "正在停止"}
+    for job_dir in [path for path in JOB_DIR.iterdir() if path.is_dir()]:
+        metadata = read_json_file(job_metadata_path(job_dir), {}) or {}
+        if metadata.get("status") in active_statuses:
+            continue
+        shutil.rmtree(job_dir, ignore_errors=True)
+        removed_count += 1
+    return removed_count
+
+
 def prune_job_history():
     if not JOB_DIR.exists():
         return
@@ -1809,10 +1824,15 @@ def render_jobs():
         return
 
     st.divider()
-    cols = st.columns([1, 4])
+    cols = st.columns([1, 1, 4])
     with cols[0]:
         st.button("刷新任务状态", use_container_width=True)
     with cols[1]:
+        if st.button("清空已结束记录", use_container_width=True):
+            removed_count = clear_finished_job_history()
+            st.success(f"已清空 {removed_count} 条已结束任务记录。")
+            st.rerun()
+    with cols[2]:
         st.subheader("后台任务")
         st.caption("页面不会自动刷新。需要看最新进度时，点左侧刷新按钮即可。")
 
@@ -1842,10 +1862,10 @@ def render_jobs():
                     key=f"cancel-job-{job.get('job_id', index)}",
                 ):
                     request_job_cancel(job_dir)
-                    st.warning("已发出停止请求。当前正在上传的几个文件会先收尾，后面的不会继续上传。")
+                    st.warning("已发出停止请求。任务会尽快结束，不会继续上传后续文件。")
                     st.rerun()
             elif job.get("cancel_requested") and is_active:
-                st.warning("正在停止：等待当前上传请求收尾。")
+                st.warning("正在停止：任务正在结束，不会继续上传后续文件。")
 
             if job.get("status") == "失败":
                 st.error(job.get("error") or job.get("message"))

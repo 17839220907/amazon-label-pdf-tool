@@ -11,7 +11,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -43,6 +42,8 @@ PROCESS_HISTORY_DIR = Path(os.environ.get("LABEL_TOOL_HISTORY_DIR", "/tmp/amazon
 PROCESS_HISTORY_LIMIT = 3
 JOB_DIR = Path(os.environ.get("LABEL_TOOL_JOB_DIR", "/tmp/amazon_label_pdf_jobs"))
 JOB_HISTORY_LIMIT = 10
+
+
 def get_int_env(name, default, minimum=1):
     try:
         raw_value = os.environ.get(name)
@@ -1124,22 +1125,6 @@ def write_log_workbook(log_rows):
     return buffer.getvalue()
 
 
-def build_zip(output_dir, log_bytes):
-    zip_buffer = io.BytesIO()
-    log_name = f"处理日志/处理日志_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-    # PDFs are already compressed; storing avoids wasting time recompressing them.
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) as archive:
-        archive.writestr("本地备份标签/", b"")
-        archive.writestr("处理日志/", b"")
-        for pdf_path in sorted(output_dir.glob("*.pdf"), key=lambda path: natural_sort_key(path.name)):
-            archive.write(pdf_path, f"本地备份标签/{pdf_path.name}")
-        archive.writestr(log_name, log_bytes)
-
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
-
-
 def format_page_text(page_index, page_count):
     if page_count and page_count > 1:
         return f"第 {page_index + 1}/{page_count} 页"
@@ -1163,6 +1148,15 @@ def mark_row_not_uploaded(row, reason="用户停止任务，未上传"):
     row["飞书文件token"] = ""
     row["处理动作"] = f"跳过({reason})"
     row["_needs_upload"] = False
+
+
+def delete_file_quietly(path):
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 def upload_pending_rows(
@@ -1258,6 +1252,7 @@ def upload_pending_rows(
                     row["飞书文件token"] = file_token
                     row["处理动作"] = "生成修改后PDF；上传飞书"
                     row["_needs_upload"] = False
+                    delete_file_quietly(row.get("_local_path"))
                     remote_by_fnsku[fnsku] = [
                         {"name": row["飞书正式文件名"], "token": file_token, "type": "file"}
                     ]
@@ -1489,10 +1484,10 @@ def process_saved_pdfs(
     else:
         report("处理完成，正在检查飞书文件夹是否还有重复 FNSKU...", 0.92)
         cleanup_deleted = cleanup_remote_duplicates(feishu_token, remote_by_fnsku)
-    report("正在生成处理日志...", 0.96)
+    report("正在生成处理日志，并清理临时 PDF...", 0.96)
     log_bytes = write_log_workbook(log_rows)
-    report("正在生成本次 PDF 备份 ZIP...", 0.98)
-    zip_bytes = build_zip(output_dir, log_bytes)
+    shutil.rmtree(output_dir, ignore_errors=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     summary = summarize_result({"log_rows": log_rows, "cleanup_deleted": cleanup_deleted})
     cleanup_text = f"，清理重复 {len(cleanup_deleted)} 个" if cleanup_deleted else ""
@@ -1522,7 +1517,6 @@ def process_saved_pdfs(
         "cleanup_deleted": cleanup_deleted,
         "log_rows": log_rows,
         "log_bytes": log_bytes,
-        "zip_bytes": zip_bytes,
         "cancelled": cancelled,
     }
 
@@ -1620,7 +1614,6 @@ def save_process_history(result):
         encoding="utf-8",
     )
     (run_dir / "处理日志.xlsx").write_bytes(result.get("log_bytes", b""))
-    (run_dir / "本次生成PDF备份.zip").write_bytes(result.get("zip_bytes", b""))
     prune_process_history()
     return metadata
 
@@ -1780,7 +1773,6 @@ def run_processing_job(job_id):
         )
 
         (job_dir / "处理日志.xlsx").write_bytes(result["log_bytes"])
-        (job_dir / "本次生成PDF备份.zip").write_bytes(result["zip_bytes"])
         try:
             save_process_history(result)
         except Exception:
@@ -1889,7 +1881,6 @@ def render_jobs():
                 st.warning("最近一次上传失败：" + job.get("last_upload_error"))
 
             log_path = job_dir / "处理日志.xlsx"
-            zip_path = job_dir / "本次生成PDF备份.zip"
             if log_path.exists():
                 st.download_button(
                     "下载处理日志 Excel",
@@ -1898,15 +1889,6 @@ def render_jobs():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                     key=f"job-log-{job.get('job_id', index)}",
-                )
-            if zip_path.exists():
-                st.download_button(
-                    "下载 PDF 备份 ZIP",
-                    data=zip_path.read_bytes(),
-                    file_name=f"标签本地备份_{job.get('job_id', index)}.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    key=f"job-zip-{job.get('job_id', index)}",
                 )
 
 
@@ -1955,7 +1937,6 @@ def render_history():
 
             run_dir = Path(item.get("_run_dir", ""))
             log_path = run_dir / "处理日志.xlsx"
-            zip_path = run_dir / "本次生成PDF备份.zip"
             if log_path.exists():
                 st.download_button(
                     "下载这次处理日志 Excel",
@@ -1964,15 +1945,6 @@ def render_history():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                     key=f"history-log-{item.get('run_id', index)}",
-                )
-            if zip_path.exists():
-                st.download_button(
-                    "下载这次 PDF 备份 ZIP",
-                    data=zip_path.read_bytes(),
-                    file_name=f"标签本地备份_{item.get('run_id', index)}.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    key=f"history-zip-{item.get('run_id', index)}",
                 )
 
 
@@ -2029,14 +2001,6 @@ def render_result(result):
         data=result["log_bytes"],
         file_name=f"处理日志_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-    st.download_button(
-        "下载本次生成 PDF 备份 ZIP",
-        data=result["zip_bytes"],
-        file_name=f"标签本地备份_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-        mime="application/zip",
         use_container_width=True,
     )
 

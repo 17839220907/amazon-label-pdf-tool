@@ -454,6 +454,7 @@ def parse_index_sheets(sheet_values_list):
         if len(missing_fnsku_rows) > 10:
             sample_text += "；..."
         warnings.append(f"已忽略 {len(missing_fnsku_rows)} 行缺少 FNSKU 的半填写索引行（{sample_text}）")
+
     if invalid_fnsku_rows:
         sample_text = "；".join(f"{row_ref} {fnsku}" for row_ref, fnsku in invalid_fnsku_rows[:10])
         if len(invalid_fnsku_rows) > 10:

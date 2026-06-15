@@ -37,6 +37,7 @@ CJK_FONT_CANDIDATES = []
 CJK_BOLD_STROKE_WIDTH = 0.05
 
 FEISHU_INDEX_RANGE_DEFAULT = "A1:G50000"
+FEISHU_OUTPUT_ROOT_FOLDER_TOKEN_DEFAULT = "JsZEfX4uWlBx3DdXJLEcUNehnZf"
 SKIP_SHEET_NAMES = {"更新日志", "更新记录", "日志", "说明", "README"}
 PROCESS_HISTORY_DIR = Path(os.environ.get("LABEL_TOOL_HISTORY_DIR", "/tmp/amazon_label_pdf_history"))
 PROCESS_HISTORY_LIMIT = 3
@@ -53,8 +54,9 @@ def get_int_env(name, default, minimum=1):
     return max(minimum, value)
 
 
-UPLOAD_WORKERS = get_int_env("LABEL_TOOL_UPLOAD_WORKERS", 1, minimum=1)
+UPLOAD_WORKERS = get_int_env("LABEL_TOOL_UPLOAD_WORKERS", 3, minimum=1)
 FEISHU_REQUEST_TIMEOUT = get_int_env("LABEL_TOOL_FEISHU_TIMEOUT", 45, minimum=5)
+FEISHU_BATCH_FOLDER_SIZE = get_int_env("LABEL_TOOL_FEISHU_BATCH_SIZE", 1000, minimum=1)
 
 LOCAL_ILLEGAL_FILENAME_CHARS = r'\/:*?"<>|'
 
@@ -437,6 +439,7 @@ def parse_index_sheets(sheet_values_list):
 
             row["FNSKU"] = fnsku
             row["_索引位置"] = row_ref
+            row["_索引Sheet"] = sheet_name
 
             existing_row = index_rows.get(fnsku)
             if existing_row:
@@ -543,14 +546,20 @@ def get_secret_value(section, key, default=""):
 
 
 def load_feishu_config():
+    output_root_folder_token = (
+        get_secret_value("feishu", "output_root_folder_token")
+        or FEISHU_OUTPUT_ROOT_FOLDER_TOKEN_DEFAULT
+    )
     config = {
         "app_id": get_secret_value("feishu", "app_id"),
         "app_secret": get_secret_value("feishu", "app_secret"),
         "spreadsheet_token": get_secret_value("feishu", "spreadsheet_token"),
-        "output_folder_token": get_secret_value("feishu", "output_folder_token"),
+        "output_folder_token": output_root_folder_token,
+        "output_root_folder_token": output_root_folder_token,
         "index_range": get_secret_value("feishu", "index_range", FEISHU_INDEX_RANGE_DEFAULT),
     }
-    missing = [key for key, value in config.items() if key != "index_range" and not value]
+    required_keys = ["app_id", "app_secret", "spreadsheet_token", "output_root_folder_token"]
+    missing = [key for key in required_keys if not config.get(key)]
     if missing:
         raise FatalError("Streamlit Secrets 缺少飞书配置：" + "、".join(missing))
     return config
@@ -684,13 +693,13 @@ def make_multipart_form(fields, file_field, file_path, display_filename, upload_
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
-def feishu_upload_file(token, config, local_path, display_filename):
+def feishu_upload_file(token, folder_token, local_path, display_filename):
     size = local_path.stat().st_size
     upload_filename = make_safe_local_filename(display_filename, "upload")
     fields = {
         "file_name": display_filename,
         "parent_type": "explorer",
-        "parent_node": config["output_folder_token"],
+        "parent_node": folder_token,
         "size": str(size),
     }
     body, content_type = make_multipart_form(
@@ -717,11 +726,41 @@ def feishu_upload_file(token, config, local_path, display_filename):
     return file_token
 
 
-def feishu_list_folder_files(token, config):
+def normalize_drive_item(item, parent_token=""):
+    name = cell_to_text(item.get("name") or item.get("file_name") or item.get("title"))
+    file_token = cell_to_text(
+        item.get("token")
+        or item.get("file_token")
+        or item.get("folder_token")
+        or item.get("node_token")
+    )
+    file_type = cell_to_text(item.get("type") or item.get("file_type") or "file")
+    timestamp = cell_to_text(
+        item.get("modified_time")
+        or item.get("updated_time")
+        or item.get("created_time")
+        or item.get("create_time")
+    )
+    return {
+        "name": name,
+        "token": file_token,
+        "type": file_type,
+        "timestamp": timestamp,
+        "parent_token": parent_token,
+    }
+
+
+def is_folder_item(item):
+    file_type = cell_to_text(item.get("type") or item.get("file_type")).lower()
+    mime_type = cell_to_text(item.get("mime_type") or item.get("mimeType")).lower()
+    return file_type == "folder" or "folder" in mime_type
+
+
+def feishu_list_folder_files(token, folder_token):
     files = []
     page_token = ""
     while True:
-        query = {"folder_token": config["output_folder_token"], "page_size": 200}
+        query = {"folder_token": folder_token, "page_size": 200}
         if page_token:
             query["page_token"] = page_token
 
@@ -736,6 +775,58 @@ def feishu_list_folder_files(token, config):
         if not page_token:
             break
     return files
+
+
+def feishu_create_folder(token, parent_folder_token, folder_name):
+    data = feishu_json_request(
+        "POST",
+        "/open-apis/drive/v1/files/create_folder",
+        token=token,
+        payload={"folder_token": parent_folder_token, "name": folder_name},
+    )
+    payload = data.get("data", {})
+    folder = payload.get("file") or payload.get("folder") or payload
+    folder_info = normalize_drive_item(folder, parent_folder_token)
+    if not folder_info["name"]:
+        folder_info["name"] = folder_name
+    if not folder_info["token"]:
+        raise FeishuError(f"飞书创建文件夹成功但未返回 token：{data}")
+    folder_info["type"] = "folder"
+    return folder_info
+
+
+def feishu_scan_folder_tree(token, root_folder_token):
+    all_items = []
+    root_child_folders = []
+    folder_counts = {}
+    visited = set()
+    stack = [(root_folder_token, 0)]
+
+    while stack:
+        folder_token, depth = stack.pop()
+        if not folder_token or folder_token in visited:
+            continue
+        visited.add(folder_token)
+
+        items = feishu_list_folder_files(token, folder_token)
+        folder_counts[folder_token] = len(items)
+        for item in items:
+            info = normalize_drive_item(item, folder_token)
+            if not info["name"] and not info["token"]:
+                continue
+            all_items.append(info)
+            if is_folder_item(item):
+                info["type"] = "folder"
+                if depth == 0:
+                    root_child_folders.append(info)
+                if info["token"]:
+                    stack.append((info["token"], depth + 1))
+
+    return {
+        "all_items": all_items,
+        "root_child_folders": root_child_folders,
+        "folder_counts": folder_counts,
+    }
 
 
 def feishu_delete_file(token, file_token, file_type="file"):
@@ -756,11 +847,14 @@ def build_remote_fnsku_map(remote_files):
         name = cell_to_text(item.get("name") or item.get("file_name") or item.get("title"))
         token = cell_to_text(item.get("token") or item.get("file_token"))
         file_type = cell_to_text(item.get("type") or "file")
+        if file_type.lower() == "folder":
+            continue
         timestamp = cell_to_text(
             item.get("modified_time")
             or item.get("updated_time")
             or item.get("created_time")
             or item.get("create_time")
+            or item.get("timestamp")
         )
         if not name or not token:
             continue
@@ -803,6 +897,62 @@ def cleanup_remote_duplicates(token, remote_by_fnsku):
             )
         remote_by_fnsku[fnsku] = [keep_file]
     return deleted
+
+
+def safe_feishu_folder_part(value, fallback="标签"):
+    text = cell_to_text(value) or fallback
+    text = re.sub(r'[\\/:*?"<>|\r\n]+', "-", text).strip(" .-_")
+    return text[:40] or fallback
+
+
+def build_batch_folder_name(site_name, run_date, sequence):
+    site_part = safe_feishu_folder_part(site_name)
+    return f"{site_part}-{run_date}-{sequence:02d}"
+
+
+def assign_upload_folders(
+    token,
+    root_folder_token,
+    pending_rows,
+    root_child_folders,
+    folder_counts,
+    run_date,
+):
+    folders_by_name = {
+        cell_to_text(folder.get("name")): dict(folder)
+        for folder in root_child_folders
+        if cell_to_text(folder.get("name")) and cell_to_text(folder.get("token"))
+    }
+    planned_counts = dict(folder_counts)
+    created_folders = []
+
+    for row in pending_rows:
+        site_name = (
+            row.get("_索引Sheet")
+            or row.get("站点")
+            or row.get("国家")
+            or "标签"
+        )
+        sequence = 1
+        while True:
+            folder_name = build_batch_folder_name(site_name, run_date, sequence)
+            folder = folders_by_name.get(folder_name)
+            if not folder:
+                folder = feishu_create_folder(token, root_folder_token, folder_name)
+                folders_by_name[folder_name] = folder
+                planned_counts[folder["token"]] = 0
+                created_folders.append(folder_name)
+
+            folder_token = folder["token"]
+            if planned_counts.get(folder_token, 0) < FEISHU_BATCH_FOLDER_SIZE:
+                planned_counts[folder_token] = planned_counts.get(folder_token, 0) + 1
+                row["_upload_folder_token"] = folder_token
+                row["_upload_folder_name"] = folder_name
+                break
+
+            sequence += 1
+
+    return created_folders
 
 
 def extract_fnsku_list(text, pattern):
@@ -1022,16 +1172,30 @@ def process_pdf_page(
         )
         row["_local_path"] = str(local_path)
         row["_needs_upload"] = True
+        row["_索引Sheet"] = index_row.get("_索引Sheet", "")
 
         if defer_upload:
             return row
 
         report_stage(f"{recognized_fnsku} 正在上传到飞书")
-        feishu_file_token = feishu_upload_file(feishu_token, feishu_config, local_path, display_filename)
+        feishu_file_token = feishu_upload_file(
+            feishu_token,
+            feishu_config["output_root_folder_token"],
+            local_path,
+            display_filename,
+        )
         row["飞书文件token"] = feishu_file_token
         row["处理动作"] = f"{action}；上传飞书"
-        remote_by_fnsku[recognized_fnsku] = [{"name": display_filename, "token": feishu_file_token, "type": "file"}]
+        remote_by_fnsku[recognized_fnsku] = [
+            {
+                "name": display_filename,
+                "token": feishu_file_token,
+                "type": "file",
+                "parent_token": feishu_config["output_root_folder_token"],
+            }
+        ]
         row["_needs_upload"] = False
+        delete_file_quietly(local_path)
         return row
 
     except RuntimeError as exc:
@@ -1180,10 +1344,11 @@ def upload_pending_rows(
 
     def upload_one(row):
         local_path = Path(row["_local_path"])
+        folder_token = row.get("_upload_folder_token") or feishu_config["output_root_folder_token"]
         last_error = None
         for attempt in range(1, 4):
             try:
-                return feishu_upload_file(feishu_token, feishu_config, local_path, row["飞书正式文件名"])
+                return feishu_upload_file(feishu_token, folder_token, local_path, row["飞书正式文件名"])
             except Exception as exc:
                 last_error = exc
                 if attempt < 3:
@@ -1254,7 +1419,12 @@ def upload_pending_rows(
                     row["_needs_upload"] = False
                     delete_file_quietly(row.get("_local_path"))
                     remote_by_fnsku[fnsku] = [
-                        {"name": row["飞书正式文件名"], "token": file_token, "type": "file"}
+                        {
+                            "name": row["飞书正式文件名"],
+                            "token": file_token,
+                            "type": "file",
+                            "parent_token": row.get("_upload_folder_token", ""),
+                        }
                     ]
                     status_text = "上传成功"
                     last_upload_error = ""
@@ -1354,8 +1524,10 @@ def process_saved_pdfs(
     report("正在读取飞书在线索引表...", 0.07, status="处理中")
     index_result = read_feishu_sheet_index(feishu_token, feishu_config)
     index_rows = index_result["rows"]
-    report(f"已读取 {len(index_rows)} 条索引，正在检查飞书目标文件夹已有标签...", 0.12)
-    remote_files = feishu_list_folder_files(feishu_token, feishu_config)
+    root_folder_token = feishu_config["output_root_folder_token"]
+    report(f"已读取 {len(index_rows)} 条索引，正在递归检查飞书标签文件合集已有标签...", 0.12)
+    folder_tree = feishu_scan_folder_tree(feishu_token, root_folder_token)
+    remote_files = folder_tree["all_items"]
     remote_by_fnsku = build_remote_fnsku_map(remote_files)
 
     saved_pdfs = sorted(saved_pdfs, key=lambda item: natural_sort_key(item[0]))
@@ -1467,6 +1639,20 @@ def process_saved_pdfs(
             mark_row_not_uploaded(row)
         report("任务已停止，已生成但未上传的标签会写入日志。", 0.90, status="正在停止", cancelled=True)
     elif upload_total:
+        report(
+            f"正在准备飞书批次文件夹：每个文件夹最多 {FEISHU_BATCH_FOLDER_SIZE} 个标签...",
+            0.49,
+        )
+        created_folders = assign_upload_folders(
+            feishu_token,
+            root_folder_token,
+            pending_rows,
+            folder_tree["root_child_folders"],
+            folder_tree["folder_counts"],
+            datetime.now().strftime("%Y%m%d"),
+        )
+        if created_folders:
+            report("已创建批次文件夹：" + "、".join(created_folders[:5]), 0.50)
         report(f"开始并发上传到飞书：共 {upload_total} 个，并发 {min(UPLOAD_WORKERS, upload_total)}。", 0.50)
         upload_stats = upload_pending_rows(
             log_rows,

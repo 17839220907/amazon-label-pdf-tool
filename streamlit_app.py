@@ -5,11 +5,14 @@ import os
 import re
 import shutil
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +20,7 @@ from string import Formatter
 
 import fitz
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
@@ -38,6 +42,9 @@ FEISHU_INDEX_RANGE_DEFAULT = "A1:G50000"
 SKIP_SHEET_NAMES = {"更新日志", "更新记录", "日志", "说明", "README"}
 PROCESS_HISTORY_DIR = Path(os.environ.get("LABEL_TOOL_HISTORY_DIR", "/tmp/amazon_label_pdf_history"))
 PROCESS_HISTORY_LIMIT = 3
+JOB_DIR = Path(os.environ.get("LABEL_TOOL_JOB_DIR", "/tmp/amazon_label_pdf_jobs"))
+JOB_HISTORY_LIMIT = 10
+UPLOAD_WORKERS = max(1, int(os.environ.get("LABEL_TOOL_UPLOAD_WORKERS", "5")))
 
 LOCAL_ILLEGAL_FILENAME_CHARS = r'\/:*?"<>|'
 
@@ -904,6 +911,7 @@ def process_pdf_page(
     remote_by_fnsku,
     delete_existing_same_fnsku,
     stage_callback=None,
+    defer_upload=False,
 ):
     recognized_fnsku = ""
     page_number = page_index + 1
@@ -975,15 +983,10 @@ def process_pdf_page(
             label_line2,
         )
 
-        report_stage(f"{recognized_fnsku} 正在上传到飞书")
-        feishu_file_token = feishu_upload_file(feishu_token, feishu_config, local_path, display_filename)
-        action = f"{action}；上传飞书"
-
-        remote_by_fnsku[recognized_fnsku] = [{"name": display_filename, "token": feishu_file_token, "type": "file"}]
         batch_fnskus.add(recognized_fnsku)
 
         page_info = f"第 {page_number}/{page_count} 页" if page_count > 1 else str(page_number)
-        return make_log_row(
+        row = make_log_row(
             source_name,
             page_info,
             recognized_fnsku,
@@ -991,11 +994,24 @@ def process_pdf_page(
             "",
             display_filename,
             local_path.name,
-            feishu_file_token,
-            action,
+            "",
+            f"{action}；等待上传飞书" if defer_upload else action,
             label_line1,
             label_line2,
         )
+        row["_local_path"] = str(local_path)
+        row["_needs_upload"] = True
+
+        if defer_upload:
+            return row
+
+        report_stage(f"{recognized_fnsku} 正在上传到飞书")
+        feishu_file_token = feishu_upload_file(feishu_token, feishu_config, local_path, display_filename)
+        row["飞书文件token"] = feishu_file_token
+        row["处理动作"] = f"{action}；上传飞书"
+        remote_by_fnsku[recognized_fnsku] = [{"name": display_filename, "token": feishu_file_token, "type": "file"}]
+        row["_needs_upload"] = False
+        return row
 
     except RuntimeError as exc:
         return fail_row(source_name, "无法提取文字", recognized_fnsku, str(exc), page_number=page_number)
@@ -1016,6 +1032,7 @@ def process_pdf_file(
     delete_existing_same_fnsku,
     stage_callback=None,
     page_finished_callback=None,
+    defer_upload=False,
 ):
     try:
         if stage_callback:
@@ -1051,6 +1068,7 @@ def process_pdf_file(
                 remote_by_fnsku,
                 delete_existing_same_fnsku,
                 stage_callback=page_stage,
+                defer_upload=defer_upload,
             )
             log_rows.append(row)
             if page_finished_callback:
@@ -1090,7 +1108,8 @@ def build_zip(output_dir, log_bytes):
     zip_buffer = io.BytesIO()
     log_name = f"处理日志/处理日志_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+    # PDFs are already compressed; storing avoids wasting time recompressing them.
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) as archive:
         archive.writestr("本地备份标签/", b"")
         archive.writestr("处理日志/", b"")
         for pdf_path in sorted(output_dir.glob("*.pdf"), key=lambda path: natural_sort_key(path.name)):
@@ -1101,126 +1120,224 @@ def build_zip(output_dir, log_bytes):
     return zip_buffer.getvalue()
 
 
-def process_uploads(pdf_files, delete_existing_same_fnsku=True):
-    status_box = st.empty()
-    detail_box = st.empty()
-    progress = st.progress(0, text="准备开始...")
+def format_page_text(page_index, page_count):
+    if page_count and page_count > 1:
+        return f"第 {page_index + 1}/{page_count} 页"
+    return "第 1 页"
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_root = Path(temp_dir)
-        input_dir = temp_root / "input"
-        output_dir = temp_root / "output"
-        input_dir.mkdir()
-        output_dir.mkdir()
 
-        status_box.info("正在读取飞书配置...")
-        feishu_config = load_feishu_config()
-        status_box.info("正在连接飞书...")
-        feishu_token = get_feishu_tenant_access_token(feishu_config)
-        status_box.info("正在读取飞书在线索引表...")
-        index_result = read_feishu_sheet_index(feishu_token, feishu_config)
-        index_rows = index_result["rows"]
-        status_box.info(f"已读取 {len(index_rows)} 条索引，正在检查飞书目标文件夹已有标签...")
-        remote_files = feishu_list_folder_files(feishu_token, feishu_config)
-        remote_by_fnsku = build_remote_fnsku_map(remote_files)
+def count_pdf_pages(saved_pdfs):
+    total_pages = 0
+    for _, pdf_path in saved_pdfs:
+        try:
+            with fitz.open(pdf_path) as document:
+                total_pages += max(document.page_count, 1)
+        except Exception:
+            total_pages += 1
+    return max(total_pages, 1)
 
-        status_box.info("正在保存上传的 PDF...")
-        saved_pdfs = []
-        for uploaded_pdf in pdf_files:
-            filename = safe_upload_name(uploaded_pdf.name, ".pdf")
-            if not filename.lower().endswith(".pdf"):
-                filename = f"{filename}.pdf"
-            pdf_path = unique_path(input_dir, filename)
-            pdf_path.write_bytes(uploaded_pdf.getvalue())
-            saved_pdfs.append((uploaded_pdf.name, pdf_path))
 
-        saved_pdfs.sort(key=lambda item: natural_sort_key(item[0]))
+def upload_pending_rows(log_rows, feishu_token, feishu_config, remote_by_fnsku, status_callback=None):
+    pending_rows = [
+        row
+        for row in log_rows
+        if row.get("_needs_upload") and row.get("匹配状态") == SUCCESS_STATUS
+    ]
+    total = len(pending_rows)
+    if not pending_rows:
+        return 0
 
-        status_box.info("正在扫描 PDF 页数...")
-        total_pages = 0
-        for _, pdf_path in saved_pdfs:
+    worker_count = min(UPLOAD_WORKERS, total)
+
+    def upload_one(row):
+        local_path = Path(row["_local_path"])
+        last_error = None
+        for attempt in range(1, 4):
             try:
-                with fitz.open(pdf_path) as document:
-                    total_pages += max(document.page_count, 1)
-            except Exception:
-                total_pages += 1
-        total_pages = max(total_pages, 1)
+                return feishu_upload_file(feishu_token, feishu_config, local_path, row["飞书正式文件名"])
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(attempt * 1.5)
+        raise last_error
 
-        fnsku_pattern = re.compile(FNSKU_REGEX, re.IGNORECASE)
-        log_rows = []
-        batch_fnskus = set()
+    done = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_row = {executor.submit(upload_one, row): row for row in pending_rows}
+        for future in as_completed(future_to_row):
+            row = future_to_row[future]
+            done += 1
+            fnsku = row.get("识别FNSKU") or ""
 
-        processed_pages = 0
-        success_count = 0
-        skipped_count = 0
-        error_count = 0
-
-        def format_page_text(page_index, page_count):
-            if page_count and page_count > 1:
-                return f"第 {page_index + 1}/{page_count} 页"
-            return "第 1 页"
-
-        def stage_callback(source_name, page_index, page_count, message):
-            detail_box.info(f"{source_name}：{format_page_text(page_index, page_count)}，{message}")
-
-        def page_finished_callback(source_name, page_index, page_count, row):
-            nonlocal processed_pages, success_count, skipped_count, error_count
-            processed_pages += 1
-            if row.get("匹配状态") == SUCCESS_STATUS:
-                success_count += 1
-            elif row.get("匹配状态") == SKIPPED_STATUS:
-                skipped_count += 1
+            try:
+                file_token = future.result()
+            except Exception as exc:
+                row["匹配状态"] = "失败"
+                row["失败原因"] = f"飞书上传失败：{exc}"
+                row["飞书文件token"] = ""
+                row["处理动作"] = "异常(飞书上传失败，未上传)"
+                row["_needs_upload"] = False
+                status_text = "上传失败"
             else:
-                error_count += 1
+                row["飞书文件token"] = file_token
+                row["处理动作"] = "生成修改后PDF；上传飞书"
+                row["_needs_upload"] = False
+                remote_by_fnsku[fnsku] = [
+                    {"name": row["飞书正式文件名"], "token": file_token, "type": "file"}
+                ]
+                status_text = "上传成功"
 
-            fnsku = row.get("识别FNSKU") or "未识别"
-            status = row.get("匹配状态") or "未知"
-            detail_box.info(
+            if status_callback:
+                status_callback(
+                    {
+                        "phase": "upload",
+                        "message": (
+                            f"正在并发上传到飞书：{done}/{total}，"
+                            f"并发 {worker_count}，{fnsku} {status_text}"
+                        ),
+                        "upload_done": done,
+                        "upload_total": total,
+                        "upload_workers": worker_count,
+                    }
+                )
+
+    return total
+
+
+def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, status_callback=None):
+    def report(message, progress=None, **fields):
+        if status_callback:
+            payload = {"message": message}
+            if progress is not None:
+                payload["progress"] = progress
+            payload.update(fields)
+            status_callback(payload)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    report("正在读取飞书配置...", 0.02, status="处理中")
+    feishu_config = load_feishu_config()
+    report("正在连接飞书...", 0.04, status="处理中")
+    feishu_token = get_feishu_tenant_access_token(feishu_config)
+    report("正在读取飞书在线索引表...", 0.07, status="处理中")
+    index_result = read_feishu_sheet_index(feishu_token, feishu_config)
+    index_rows = index_result["rows"]
+    report(f"已读取 {len(index_rows)} 条索引，正在检查飞书目标文件夹已有标签...", 0.12)
+    remote_files = feishu_list_folder_files(feishu_token, feishu_config)
+    remote_by_fnsku = build_remote_fnsku_map(remote_files)
+
+    saved_pdfs = sorted(saved_pdfs, key=lambda item: natural_sort_key(item[0]))
+
+    report("正在扫描 PDF 页数...", 0.15)
+    total_pages = count_pdf_pages(saved_pdfs)
+
+    fnsku_pattern = re.compile(FNSKU_REGEX, re.IGNORECASE)
+    log_rows = []
+    batch_fnskus = set()
+
+    processed_pages = 0
+    pending_upload_count = 0
+    skipped_count = 0
+    error_count = 0
+
+    def stage_callback(source_name, page_index, page_count, message):
+        report(
+            f"{source_name}：{format_page_text(page_index, page_count)}，{message}",
+            phase="prepare",
+        )
+
+    def page_finished_callback(source_name, page_index, page_count, row):
+        nonlocal processed_pages, pending_upload_count, skipped_count, error_count
+        processed_pages += 1
+        if row.get("匹配状态") == SUCCESS_STATUS:
+            pending_upload_count += 1
+        elif row.get("匹配状态") == SKIPPED_STATUS:
+            skipped_count += 1
+        else:
+            error_count += 1
+
+        fnsku = row.get("识别FNSKU") or "未识别"
+        status = row.get("匹配状态") or "未知"
+        progress_value = 0.15 + min(processed_pages / total_pages, 1.0) * 0.35
+        report(
+            (
                 f"{source_name}：{format_page_text(page_index, page_count)}，"
                 f"FNSKU：{fnsku}，结果：{status}"
-            )
-            progress.progress(
-                min(processed_pages / total_pages, 1.0),
-                text=(
-                    f"已处理 {processed_pages}/{total_pages} 张标签，"
-                    f"上传 {success_count}，跳过 {skipped_count}，异常 {error_count}"
-                ),
-            )
-
-        progress.progress(0, text=f"准备处理 {total_pages} 张标签...")
-        status_box.info(f"开始处理，共 {len(saved_pdfs)} 个 PDF，约 {total_pages} 张标签。")
-
-        for index, (source_name, pdf_path) in enumerate(saved_pdfs, start=1):
-            status_box.info(f"正在处理第 {index}/{len(saved_pdfs)} 个 PDF：{source_name}")
-            log_rows.extend(
-                process_pdf_file(
-                    pdf_path,
-                    source_name,
-                    index_rows,
-                    fnsku_pattern,
-                    output_dir,
-                    batch_fnskus,
-                    feishu_token,
-                    feishu_config,
-                    remote_by_fnsku,
-                    delete_existing_same_fnsku,
-                    stage_callback=stage_callback,
-                    page_finished_callback=page_finished_callback,
-                )
-            )
-
-        progress.progress(1.0, text="处理完成，正在检查飞书文件夹是否还有重复 FNSKU...")
-        detail_box.empty()
-        status_box.info("正在检查并清理飞书目标文件夹里的重复 FNSKU...")
-        cleanup_deleted = cleanup_remote_duplicates(feishu_token, remote_by_fnsku)
-        status_box.info("正在生成处理日志...")
-        log_bytes = write_log_workbook(log_rows)
-        status_box.info("正在生成本次 PDF 备份 ZIP...")
-        zip_bytes = build_zip(output_dir, log_bytes)
-        cleanup_text = f"，清理重复 {len(cleanup_deleted)} 个" if cleanup_deleted else ""
-        status_box.success(
-            f"全部完成：上传 {success_count} 张，跳过 {skipped_count} 张，异常 {error_count} 张{cleanup_text}。"
+            ),
+            progress_value,
+            phase="prepare",
+            processed_pages=processed_pages,
+            total_pages=total_pages,
+            pending_upload_count=pending_upload_count,
+            skipped_count=skipped_count,
+            error_count=error_count,
         )
+
+    report(f"开始处理，共 {len(saved_pdfs)} 个 PDF，约 {total_pages} 张标签。", 0.15)
+
+    for index, (source_name, pdf_path) in enumerate(saved_pdfs, start=1):
+        report(f"正在处理第 {index}/{len(saved_pdfs)} 个 PDF：{source_name}", phase="prepare")
+        log_rows.extend(
+            process_pdf_file(
+                pdf_path,
+                source_name,
+                index_rows,
+                fnsku_pattern,
+                output_dir,
+                batch_fnskus,
+                feishu_token,
+                feishu_config,
+                remote_by_fnsku,
+                delete_existing_same_fnsku,
+                stage_callback=stage_callback,
+                page_finished_callback=page_finished_callback,
+                defer_upload=True,
+            )
+        )
+
+    pending_rows = [
+        row
+        for row in log_rows
+        if row.get("_needs_upload") and row.get("匹配状态") == SUCCESS_STATUS
+    ]
+    upload_total = len(pending_rows)
+
+    def upload_status_callback(payload):
+        upload_done = payload.get("upload_done", 0)
+        upload_total_value = max(payload.get("upload_total", upload_total), 1)
+        progress_value = 0.50 + min(upload_done / upload_total_value, 1.0) * 0.40
+        report(
+            payload["message"],
+            progress_value,
+            status="处理中",
+            phase="upload",
+            upload_done=upload_done,
+            upload_total=payload.get("upload_total", upload_total),
+            upload_workers=payload.get("upload_workers", UPLOAD_WORKERS),
+        )
+
+    if upload_total:
+        report(f"开始并发上传到飞书：共 {upload_total} 个，并发 {min(UPLOAD_WORKERS, upload_total)}。", 0.50)
+    upload_pending_rows(log_rows, feishu_token, feishu_config, remote_by_fnsku, upload_status_callback)
+
+    report("处理完成，正在检查飞书文件夹是否还有重复 FNSKU...", 0.92)
+    cleanup_deleted = cleanup_remote_duplicates(feishu_token, remote_by_fnsku)
+    report("正在生成处理日志...", 0.96)
+    log_bytes = write_log_workbook(log_rows)
+    report("正在生成本次 PDF 备份 ZIP...", 0.98)
+    zip_bytes = build_zip(output_dir, log_bytes)
+
+    summary = summarize_result({"log_rows": log_rows, "cleanup_deleted": cleanup_deleted})
+    cleanup_text = f"，清理重复 {len(cleanup_deleted)} 个" if cleanup_deleted else ""
+    report(
+        (
+            f"全部完成：上传 {summary['success_count']} 张，跳过 {summary['skipped_count']} 张，"
+            f"异常 {summary['error_count']} 张{cleanup_text}。"
+        ),
+        1.0,
+        status="完成",
+        **summary,
+    )
 
     return {
         "warnings": index_result["warnings"],
@@ -1232,6 +1349,49 @@ def process_uploads(pdf_files, delete_existing_same_fnsku=True):
         "log_bytes": log_bytes,
         "zip_bytes": zip_bytes,
     }
+
+
+def save_uploaded_files_to_dir(pdf_files, input_dir):
+    input_dir.mkdir(parents=True, exist_ok=True)
+    saved_pdfs = []
+    for uploaded_pdf in pdf_files:
+        filename = safe_upload_name(uploaded_pdf.name, ".pdf")
+        if not filename.lower().endswith(".pdf"):
+            filename = f"{filename}.pdf"
+        pdf_path = unique_path(input_dir, filename)
+        pdf_path.write_bytes(uploaded_pdf.getvalue())
+        saved_pdfs.append((uploaded_pdf.name, pdf_path))
+    return sorted(saved_pdfs, key=lambda item: natural_sort_key(item[0]))
+
+
+def process_uploads(pdf_files, delete_existing_same_fnsku=True):
+    status_box = st.empty()
+    progress = st.progress(0, text="准备开始...")
+
+    def status_callback(payload):
+        message = payload.get("message", "")
+        progress_value = payload.get("progress")
+        if progress_value is not None:
+            progress.progress(
+                min(max(float(progress_value), 0.0), 1.0),
+                text=message,
+            )
+        status_box.info(message)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir)
+        input_dir = temp_root / "input"
+        output_dir = temp_root / "output"
+        status_box.info("正在保存上传的 PDF...")
+        saved_pdfs = save_uploaded_files_to_dir(pdf_files, input_dir)
+        result = process_saved_pdfs(
+            saved_pdfs,
+            output_dir,
+            delete_existing_same_fnsku=delete_existing_same_fnsku,
+            status_callback=status_callback,
+        )
+        status_box.success("全部完成。")
+        return result
 
 
 def summarize_result(result):
@@ -1287,6 +1447,206 @@ def save_process_history(result):
     (run_dir / "本次生成PDF备份.zip").write_bytes(result.get("zip_bytes", b""))
     prune_process_history()
     return metadata
+
+
+def read_json_file(path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json_file(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def job_metadata_path(job_dir):
+    return job_dir / "metadata.json"
+
+
+def update_job_metadata(job_dir, **updates):
+    metadata_path = job_metadata_path(job_dir)
+    metadata = read_json_file(metadata_path, {}) or {}
+    metadata.update(updates)
+    metadata["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    write_json_file(metadata_path, metadata)
+    return metadata
+
+
+def prune_job_history():
+    if not JOB_DIR.exists():
+        return
+
+    job_dirs = [path for path in JOB_DIR.iterdir() if path.is_dir()]
+    job_dirs.sort(key=lambda path: path.name, reverse=True)
+    for old_dir in job_dirs[JOB_HISTORY_LIMIT:]:
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+
+def create_processing_job(pdf_files):
+    JOB_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+    job_dir = JOB_DIR / job_id
+    input_dir = job_dir / "input"
+    output_dir = job_dir / "output"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_pdfs = save_uploaded_files_to_dir(pdf_files, input_dir)
+    file_records = [{"source_name": source_name, "path": str(path)} for source_name, path in saved_pdfs]
+    write_json_file(job_dir / "files.json", file_records)
+
+    metadata = {
+        "job_id": job_id,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "排队中",
+        "message": "任务已提交，后台准备开始处理。",
+        "progress": 0.0,
+        "pdf_count": len(saved_pdfs),
+        "upload_workers": UPLOAD_WORKERS,
+    }
+    write_json_file(job_metadata_path(job_dir), metadata)
+    prune_job_history()
+
+    thread = threading.Thread(target=run_processing_job, args=(job_id,), daemon=True)
+    thread.start()
+    return metadata
+
+
+def run_processing_job(job_id):
+    job_dir = JOB_DIR / job_id
+    output_dir = job_dir / "output"
+    file_records = read_json_file(job_dir / "files.json", []) or []
+    saved_pdfs = [(record["source_name"], Path(record["path"])) for record in file_records]
+
+    def status_callback(payload):
+        allowed_keys = {
+            "status",
+            "message",
+            "progress",
+            "phase",
+            "processed_pages",
+            "total_pages",
+            "pending_upload_count",
+            "skipped_count",
+            "error_count",
+            "upload_done",
+            "upload_total",
+            "upload_workers",
+            "success_count",
+            "total_count",
+            "cleanup_deleted_count",
+        }
+        clean_payload = {key: payload[key] for key in allowed_keys if key in payload}
+        update_job_metadata(job_dir, **clean_payload)
+
+    try:
+        update_job_metadata(job_dir, status="处理中", message="后台任务已开始。", progress=0.01)
+        result = process_saved_pdfs(saved_pdfs, output_dir, status_callback=status_callback)
+
+        (job_dir / "处理日志.xlsx").write_bytes(result["log_bytes"])
+        (job_dir / "本次生成PDF备份.zip").write_bytes(result["zip_bytes"])
+        try:
+            save_process_history(result)
+        except Exception:
+            pass
+
+        summary = summarize_result(result)
+        update_job_metadata(
+            job_dir,
+            status="完成",
+            message=(
+                f"完成：上传 {summary['success_count']}，跳过 {summary['skipped_count']}，"
+                f"异常 {summary['error_count']}。"
+            ),
+            progress=1.0,
+            **summary,
+        )
+    except Exception as exc:
+        update_job_metadata(
+            job_dir,
+            status="失败",
+            message=f"任务失败：{exc}",
+            error=str(exc),
+            progress=1.0,
+        )
+
+
+def load_job_history():
+    if not JOB_DIR.exists():
+        return []
+
+    jobs = []
+    for job_dir in sorted([path for path in JOB_DIR.iterdir() if path.is_dir()], key=lambda p: p.name, reverse=True):
+        metadata = read_json_file(job_metadata_path(job_dir), None)
+        if not metadata:
+            continue
+        metadata["_job_dir"] = str(job_dir)
+        jobs.append(metadata)
+    return jobs[:JOB_HISTORY_LIMIT]
+
+
+def render_jobs():
+    jobs = load_job_history()
+    if not jobs:
+        return
+
+    st.divider()
+    if any(job.get("status") in {"排队中", "处理中"} for job in jobs):
+        components.html(
+            "<script>setTimeout(() => window.parent.location.reload(), 10000);</script>",
+            height=0,
+        )
+
+    cols = st.columns([1, 4])
+    with cols[0]:
+        st.button("刷新任务状态", use_container_width=True)
+    with cols[1]:
+        st.subheader("后台任务")
+
+    for index, job in enumerate(jobs, start=1):
+        title = (
+            f"{job.get('created_at', '未知时间')}｜{job.get('status', '未知')}｜"
+            f"{job.get('message', '')}"
+        )
+        with st.expander(title, expanded=index == 1):
+            progress_value = float(job.get("progress") or 0)
+            st.progress(min(max(progress_value, 0.0), 1.0), text=job.get("message", ""))
+            cols = st.columns(5)
+            cols[0].metric("PDF", job.get("pdf_count", 0))
+            cols[1].metric("上传", job.get("success_count", job.get("upload_done", 0)))
+            cols[2].metric("跳过", job.get("skipped_count", 0))
+            cols[3].metric("异常", job.get("error_count", 0))
+            cols[4].metric("并发", job.get("upload_workers", UPLOAD_WORKERS))
+
+            if job.get("status") == "失败":
+                st.error(job.get("error") or job.get("message"))
+
+            job_dir = Path(job.get("_job_dir", ""))
+            log_path = job_dir / "处理日志.xlsx"
+            zip_path = job_dir / "本次生成PDF备份.zip"
+            if log_path.exists():
+                st.download_button(
+                    "下载处理日志 Excel",
+                    data=log_path.read_bytes(),
+                    file_name=f"处理日志_{job.get('job_id', index)}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"job-log-{job.get('job_id', index)}",
+                )
+            if zip_path.exists():
+                st.download_button(
+                    "下载 PDF 备份 ZIP",
+                    data=zip_path.read_bytes(),
+                    file_name=f"标签本地备份_{job.get('job_id', index)}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key=f"job-zip-{job.get('job_id', index)}",
+                )
 
 
 def load_process_history():
@@ -1431,28 +1791,20 @@ def main():
     )
 
     can_process = bool(pdf_files)
-    if st.button("开始处理并上传飞书", type="primary", disabled=not can_process, use_container_width=True):
+    if st.button("提交后台处理任务", type="primary", disabled=not can_process, use_container_width=True):
         try:
-            with st.spinner("处理中，请不要关闭页面..."):
-                result = process_uploads(pdf_files, delete_existing_same_fnsku=True)
-                try:
-                    save_process_history(result)
-                except Exception as exc:
-                    st.warning(f"处理完成，但保存最近记录失败：{exc}")
-                st.session_state["last_result"] = result
+            with st.spinner("正在提交任务，请稍等..."):
+                job = create_processing_job(pdf_files)
+                st.session_state["last_job_id"] = job["job_id"]
+            st.success(f"任务已提交：{job['job_id']}。可以关闭页面，之后回来刷新查看结果。")
         except FatalError as exc:
             st.error(f"启动失败：{exc}")
-            st.session_state.pop("last_result", None)
         except FeishuError as exc:
             st.error(f"飞书接口失败：{exc}")
-            st.session_state.pop("last_result", None)
         except Exception as exc:
             st.error(f"程序异常停止：{exc}")
-            st.session_state.pop("last_result", None)
 
-    if "last_result" in st.session_state:
-        render_result(st.session_state["last_result"])
-
+    render_jobs()
     render_history()
 
 

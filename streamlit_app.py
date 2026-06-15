@@ -43,8 +43,17 @@ PROCESS_HISTORY_DIR = Path(os.environ.get("LABEL_TOOL_HISTORY_DIR", "/tmp/amazon
 PROCESS_HISTORY_LIMIT = 3
 JOB_DIR = Path(os.environ.get("LABEL_TOOL_JOB_DIR", "/tmp/amazon_label_pdf_jobs"))
 JOB_HISTORY_LIMIT = 10
-UPLOAD_WORKERS = max(1, int(os.environ.get("LABEL_TOOL_UPLOAD_WORKERS", "1")))
-FEISHU_REQUEST_TIMEOUT = max(5, int(os.environ.get("LABEL_TOOL_FEISHU_TIMEOUT", "45")))
+def get_int_env(name, default, minimum=1):
+    try:
+        raw_value = os.environ.get(name)
+        value = int(str(raw_value).strip() if raw_value is not None else default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+UPLOAD_WORKERS = get_int_env("LABEL_TOOL_UPLOAD_WORKERS", 1, minimum=1)
+FEISHU_REQUEST_TIMEOUT = get_int_env("LABEL_TOOL_FEISHU_TIMEOUT", 45, minimum=5)
 
 LOCAL_ILLEGAL_FILENAME_CHARS = r'\/:*?"<>|'
 
@@ -1623,6 +1632,13 @@ def read_json_file(path, default=None):
         return default
 
 
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def write_json_file(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
@@ -1844,7 +1860,7 @@ def render_jobs():
         with st.expander(title, expanded=index == 1):
             job_dir = Path(job.get("_job_dir", ""))
             is_active = job.get("status") in {"排队中", "处理中", "正在停止"}
-            progress_value = float(job.get("progress") or 0)
+            progress_value = safe_float(job.get("progress"), 0.0)
             st.progress(min(max(progress_value, 0.0), 1.0), text=job.get("message", ""))
             cols = st.columns(6)
             cols[0].metric("PDF", job.get("pdf_count", 0))

@@ -1,0 +1,29 @@
+name: Apply startup hardening
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch Streamlit app
+        run: python .github/scripts/apply_startup_hardening.py
+      - name: Remove one-time files
+        run: |
+          rm -f .github/workflows/apply-startup-hardening.yml
+          rm -f .github/scripts/apply_startup_hardening.py
+      - name: Commit patched app
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add streamlit_app.py .github/workflows/apply-startup-hardening.yml .github/scripts/apply_startup_hardening.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Harden Streamlit startup config parsing"
+          git push

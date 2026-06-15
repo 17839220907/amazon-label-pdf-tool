@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +20,6 @@ from string import Formatter
 
 import fitz
 import streamlit as st
-import streamlit.components.v1 as components
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
@@ -79,6 +78,10 @@ class FileNameError(Exception):
 
 
 class FeishuError(Exception):
+    pass
+
+
+class JobCancelled(Exception):
     pass
 
 
@@ -644,7 +647,7 @@ def read_feishu_sheet_index(token, config):
     return parse_index_sheets(sheet_values_list)
 
 
-def make_multipart_form(fields, file_field, file_path, display_filename):
+def make_multipart_form(fields, file_field, file_path, display_filename, upload_filename=None):
     boundary = "----label-feishu-" + uuid.uuid4().hex
     body = bytearray()
 
@@ -654,12 +657,13 @@ def make_multipart_form(fields, file_field, file_path, display_filename):
         body.extend(str(value).encode("utf-8"))
         body.extend(b"\r\n")
 
+    upload_filename = upload_filename or display_filename
     content_type = mimetypes.guess_type(display_filename)[0] or "application/pdf"
     body.extend(f"--{boundary}\r\n".encode())
     body.extend(
         (
             f'Content-Disposition: form-data; name="{file_field}"; '
-            f'filename="{display_filename}"\r\n'
+            f'filename="{upload_filename}"\r\n'
         ).encode("utf-8")
     )
     body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
@@ -672,13 +676,20 @@ def make_multipart_form(fields, file_field, file_path, display_filename):
 
 def feishu_upload_file(token, config, local_path, display_filename):
     size = local_path.stat().st_size
+    upload_filename = make_safe_local_filename(display_filename, "upload")
     fields = {
         "file_name": display_filename,
         "parent_type": "explorer",
         "parent_node": config["output_folder_token"],
         "size": str(size),
     }
-    body, content_type = make_multipart_form(fields, "file", local_path, display_filename)
+    body, content_type = make_multipart_form(
+        fields,
+        "file",
+        local_path,
+        display_filename,
+        upload_filename=upload_filename,
+    )
     request = urllib.request.Request(
         "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all",
         data=body,
@@ -1137,7 +1148,22 @@ def count_pdf_pages(saved_pdfs):
     return max(total_pages, 1)
 
 
-def upload_pending_rows(log_rows, feishu_token, feishu_config, remote_by_fnsku, status_callback=None):
+def mark_row_not_uploaded(row, reason="用户停止任务，未上传"):
+    row["匹配状态"] = SKIPPED_STATUS
+    row["失败原因"] = reason
+    row["飞书文件token"] = ""
+    row["处理动作"] = f"跳过({reason})"
+    row["_needs_upload"] = False
+
+
+def upload_pending_rows(
+    log_rows,
+    feishu_token,
+    feishu_config,
+    remote_by_fnsku,
+    status_callback=None,
+    cancel_callback=None,
+):
     pending_rows = [
         row
         for row in log_rows
@@ -1145,7 +1171,7 @@ def upload_pending_rows(log_rows, feishu_token, feishu_config, remote_by_fnsku, 
     ]
     total = len(pending_rows)
     if not pending_rows:
-        return 0
+        return {"total": 0, "done": 0, "success": 0, "failed": 0, "cancelled": False}
 
     worker_count = min(UPLOAD_WORKERS, total)
 
@@ -1162,49 +1188,135 @@ def upload_pending_rows(log_rows, feishu_token, feishu_config, remote_by_fnsku, 
         raise last_error
 
     done = 0
+    success_count = 0
+    failed_count = 0
+    next_index = 0
+    cancelled = False
+
+    def cancel_requested():
+        return bool(cancel_callback and cancel_callback())
+
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_row = {executor.submit(upload_one, row): row for row in pending_rows}
-        for future in as_completed(future_to_row):
-            row = future_to_row[future]
-            done += 1
-            fnsku = row.get("识别FNSKU") or ""
+        future_to_row = {}
 
-            try:
-                file_token = future.result()
-            except Exception as exc:
-                row["匹配状态"] = "失败"
-                row["失败原因"] = f"飞书上传失败：{exc}"
-                row["飞书文件token"] = ""
-                row["处理动作"] = "异常(飞书上传失败，未上传)"
-                row["_needs_upload"] = False
-                status_text = "上传失败"
-            else:
-                row["飞书文件token"] = file_token
-                row["处理动作"] = "生成修改后PDF；上传飞书"
-                row["_needs_upload"] = False
-                remote_by_fnsku[fnsku] = [
-                    {"name": row["飞书正式文件名"], "token": file_token, "type": "file"}
-                ]
-                status_text = "上传成功"
+        def submit_next():
+            nonlocal next_index
+            if next_index >= total:
+                return False
+            row = pending_rows[next_index]
+            next_index += 1
+            future_to_row[executor.submit(upload_one, row)] = row
+            return True
 
-            if status_callback:
-                status_callback(
-                    {
-                        "phase": "upload",
-                        "message": (
-                            f"正在并发上传到飞书：{done}/{total}，"
-                            f"并发 {worker_count}，{fnsku} {status_text}"
-                        ),
-                        "upload_done": done,
-                        "upload_total": total,
-                        "upload_workers": worker_count,
-                    }
-                )
+        while next_index < total and len(future_to_row) < worker_count and not cancel_requested():
+            submit_next()
 
-    return total
+        if next_index == 0 and cancel_requested():
+            cancelled = True
+
+        while future_to_row:
+            if cancel_requested():
+                cancelled = True
+
+            done_futures, _ = wait(
+                future_to_row.keys(),
+                timeout=1,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done_futures:
+                continue
+
+            for future in done_futures:
+                row = future_to_row.pop(future)
+                done += 1
+                fnsku = row.get("识别FNSKU") or ""
+
+                try:
+                    file_token = future.result()
+                except Exception as exc:
+                    failed_count += 1
+                    row["匹配状态"] = "失败"
+                    row["失败原因"] = f"飞书上传失败：{exc}"
+                    row["飞书文件token"] = ""
+                    row["处理动作"] = "异常(飞书上传失败，未上传)"
+                    row["_needs_upload"] = False
+                    status_text = "上传失败"
+                    last_upload_error = f"{fnsku} 上传失败：{exc}"
+                else:
+                    success_count += 1
+                    row["飞书文件token"] = file_token
+                    row["处理动作"] = "生成修改后PDF；上传飞书"
+                    row["_needs_upload"] = False
+                    remote_by_fnsku[fnsku] = [
+                        {"name": row["飞书正式文件名"], "token": file_token, "type": "file"}
+                    ]
+                    status_text = "上传成功"
+                    last_upload_error = ""
+
+                if status_callback:
+                    status_callback(
+                        {
+                            "phase": "upload",
+                            "message": (
+                                f"正在并发上传到飞书：{done}/{total}，"
+                                f"成功 {success_count}，失败 {failed_count}，并发 {worker_count}，"
+                                f"{fnsku} {status_text}"
+                            ),
+                            "upload_done": done,
+                            "upload_total": total,
+                            "upload_success_count": success_count,
+                            "upload_failed_count": failed_count,
+                            "upload_workers": worker_count,
+                            "last_upload_error": last_upload_error,
+                        }
+                    )
+
+            if cancelled:
+                continue
+
+            while next_index < total and len(future_to_row) < worker_count and not cancel_requested():
+                submit_next()
+
+        if cancel_requested():
+            cancelled = True
+
+    if cancelled and next_index < total:
+        for row in pending_rows[next_index:]:
+            mark_row_not_uploaded(row)
+
+    if cancelled and status_callback:
+        status_callback(
+            {
+                "phase": "upload",
+                "message": (
+                    f"任务已停止：已尝试上传 {done}/{total}，"
+                    f"成功 {success_count}，失败 {failed_count}，剩余未上传。"
+                ),
+                "upload_done": done,
+                "upload_total": total,
+                "upload_success_count": success_count,
+                "upload_failed_count": failed_count,
+                "upload_workers": worker_count,
+                "cancelled": True,
+            }
+        )
+
+    return {
+        "total": total,
+        "done": done,
+        "success": success_count,
+        "failed": failed_count,
+        "cancelled": cancelled,
+    }
 
 
-def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, status_callback=None):
+def process_saved_pdfs(
+    saved_pdfs,
+    output_dir,
+    delete_existing_same_fnsku=True,
+    status_callback=None,
+    cancel_callback=None,
+):
     def report(message, progress=None, **fields):
         if status_callback:
             payload = {"message": message}
@@ -1212,6 +1324,9 @@ def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, 
                 payload["progress"] = progress
             payload.update(fields)
             status_callback(payload)
+
+    def cancel_requested():
+        return bool(cancel_callback and cancel_callback())
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1239,6 +1354,7 @@ def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, 
     pending_upload_count = 0
     skipped_count = 0
     error_count = 0
+    cancelled = False
 
     def stage_callback(source_name, page_index, page_count, message):
         report(
@@ -1276,6 +1392,10 @@ def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, 
     report(f"开始处理，共 {len(saved_pdfs)} 个 PDF，约 {total_pages} 张标签。", 0.15)
 
     for index, (source_name, pdf_path) in enumerate(saved_pdfs, start=1):
+        if cancel_requested():
+            cancelled = True
+            report("任务已收到停止请求，剩余 PDF 不再处理。", status="正在停止", cancelled=True)
+            break
         report(f"正在处理第 {index}/{len(saved_pdfs)} 个 PDF：{source_name}", phase="prepare")
         log_rows.extend(
             process_pdf_file(
@@ -1304,24 +1424,49 @@ def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, 
 
     def upload_status_callback(payload):
         upload_done = payload.get("upload_done", 0)
+        upload_success_count = payload.get("upload_success_count", 0)
+        upload_failed_count = payload.get("upload_failed_count", 0)
         upload_total_value = max(payload.get("upload_total", upload_total), 1)
         progress_value = 0.50 + min(upload_done / upload_total_value, 1.0) * 0.40
         report(
             payload["message"],
             progress_value,
-            status="处理中",
+            status="正在停止" if payload.get("cancelled") else "处理中",
             phase="upload",
             upload_done=upload_done,
             upload_total=payload.get("upload_total", upload_total),
+            upload_success_count=upload_success_count,
+            upload_failed_count=upload_failed_count,
             upload_workers=payload.get("upload_workers", UPLOAD_WORKERS),
+            last_upload_error=payload.get("last_upload_error", ""),
+            error_count=error_count + upload_failed_count,
+            success_count=upload_success_count,
+            cancelled=payload.get("cancelled", False),
         )
 
-    if upload_total:
+    upload_stats = {"success": 0, "failed": 0, "cancelled": cancelled}
+    if cancelled:
+        for row in pending_rows:
+            mark_row_not_uploaded(row)
+        report("任务已停止，已生成但未上传的标签会写入日志。", 0.90, status="正在停止", cancelled=True)
+    elif upload_total:
         report(f"开始并发上传到飞书：共 {upload_total} 个，并发 {min(UPLOAD_WORKERS, upload_total)}。", 0.50)
-    upload_pending_rows(log_rows, feishu_token, feishu_config, remote_by_fnsku, upload_status_callback)
+        upload_stats = upload_pending_rows(
+            log_rows,
+            feishu_token,
+            feishu_config,
+            remote_by_fnsku,
+            upload_status_callback,
+            cancel_callback=cancel_callback,
+        )
+        cancelled = cancelled or upload_stats.get("cancelled", False)
 
-    report("处理完成，正在检查飞书文件夹是否还有重复 FNSKU...", 0.92)
-    cleanup_deleted = cleanup_remote_duplicates(feishu_token, remote_by_fnsku)
+    if cancelled:
+        report("任务已停止，正在生成处理日志...", 0.96, status="正在停止", cancelled=True)
+        cleanup_deleted = []
+    else:
+        report("处理完成，正在检查飞书文件夹是否还有重复 FNSKU...", 0.92)
+        cleanup_deleted = cleanup_remote_duplicates(feishu_token, remote_by_fnsku)
     report("正在生成处理日志...", 0.96)
     log_bytes = write_log_workbook(log_rows)
     report("正在生成本次 PDF 备份 ZIP...", 0.98)
@@ -1329,13 +1474,21 @@ def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, 
 
     summary = summarize_result({"log_rows": log_rows, "cleanup_deleted": cleanup_deleted})
     cleanup_text = f"，清理重复 {len(cleanup_deleted)} 个" if cleanup_deleted else ""
-    report(
-        (
+    final_status = "已停止" if cancelled else "完成"
+    final_text = (
+        f"已停止：已上传 {summary['success_count']} 张，跳过 {summary['skipped_count']} 张，"
+        f"异常 {summary['error_count']} 张。"
+        if cancelled
+        else (
             f"全部完成：上传 {summary['success_count']} 张，跳过 {summary['skipped_count']} 张，"
             f"异常 {summary['error_count']} 张{cleanup_text}。"
-        ),
+        )
+    )
+    report(
+        final_text,
         1.0,
-        status="完成",
+        status=final_status,
+        cancelled=cancelled,
         **summary,
     )
 
@@ -1348,6 +1501,7 @@ def process_saved_pdfs(saved_pdfs, output_dir, delete_existing_same_fnsku=True, 
         "log_rows": log_rows,
         "log_bytes": log_bytes,
         "zip_bytes": zip_bytes,
+        "cancelled": cancelled,
     }
 
 
@@ -1467,13 +1621,34 @@ def job_metadata_path(job_dir):
     return job_dir / "metadata.json"
 
 
+def job_cancel_path(job_dir):
+    return job_dir / "cancel.requested"
+
+
 def update_job_metadata(job_dir, **updates):
     metadata_path = job_metadata_path(job_dir)
     metadata = read_json_file(metadata_path, {}) or {}
+    if metadata.get("cancel_requested") and updates.get("status") == "处理中":
+        updates["status"] = "正在停止"
     metadata.update(updates)
     metadata["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     write_json_file(metadata_path, metadata)
     return metadata
+
+
+def is_job_cancel_requested(job_dir):
+    metadata = read_json_file(job_metadata_path(job_dir), {}) or {}
+    return bool(metadata.get("cancel_requested") or job_cancel_path(job_dir).exists())
+
+
+def request_job_cancel(job_dir):
+    job_cancel_path(job_dir).write_text(datetime.now().isoformat(), encoding="utf-8")
+    return update_job_metadata(
+        job_dir,
+        cancel_requested=True,
+        status="正在停止",
+        message="已请求停止，正在等待当前上传收尾。",
+    )
 
 
 def prune_job_history():
@@ -1508,6 +1683,7 @@ def create_processing_job(pdf_files):
         "progress": 0.0,
         "pdf_count": len(saved_pdfs),
         "upload_workers": UPLOAD_WORKERS,
+        "cancel_requested": False,
     }
     write_json_file(job_metadata_path(job_dir), metadata)
     prune_job_history()
@@ -1536,17 +1712,28 @@ def run_processing_job(job_id):
             "error_count",
             "upload_done",
             "upload_total",
+            "upload_success_count",
+            "upload_failed_count",
             "upload_workers",
             "success_count",
             "total_count",
             "cleanup_deleted_count",
+            "last_upload_error",
+            "cancelled",
         }
         clean_payload = {key: payload[key] for key in allowed_keys if key in payload}
+        if is_job_cancel_requested(job_dir) and clean_payload.get("status") == "处理中":
+            clean_payload["status"] = "正在停止"
         update_job_metadata(job_dir, **clean_payload)
 
     try:
         update_job_metadata(job_dir, status="处理中", message="后台任务已开始。", progress=0.01)
-        result = process_saved_pdfs(saved_pdfs, output_dir, status_callback=status_callback)
+        result = process_saved_pdfs(
+            saved_pdfs,
+            output_dir,
+            status_callback=status_callback,
+            cancel_callback=lambda: is_job_cancel_requested(job_dir),
+        )
 
         (job_dir / "处理日志.xlsx").write_bytes(result["log_bytes"])
         (job_dir / "本次生成PDF备份.zip").write_bytes(result["zip_bytes"])
@@ -1556,16 +1743,29 @@ def run_processing_job(job_id):
             pass
 
         summary = summarize_result(result)
-        update_job_metadata(
-            job_dir,
-            status="完成",
-            message=(
-                f"完成：上传 {summary['success_count']}，跳过 {summary['skipped_count']}，"
-                f"异常 {summary['error_count']}。"
-            ),
-            progress=1.0,
-            **summary,
-        )
+        if result.get("cancelled"):
+            update_job_metadata(
+                job_dir,
+                status="已停止",
+                message=(
+                    f"已停止：上传 {summary['success_count']}，跳过 {summary['skipped_count']}，"
+                    f"异常 {summary['error_count']}。"
+                ),
+                progress=1.0,
+                cancelled=True,
+                **summary,
+            )
+        else:
+            update_job_metadata(
+                job_dir,
+                status="完成",
+                message=(
+                    f"完成：上传 {summary['success_count']}，跳过 {summary['skipped_count']}，"
+                    f"异常 {summary['error_count']}。"
+                ),
+                progress=1.0,
+                **summary,
+            )
     except Exception as exc:
         update_job_metadata(
             job_dir,
@@ -1596,17 +1796,12 @@ def render_jobs():
         return
 
     st.divider()
-    if any(job.get("status") in {"排队中", "处理中"} for job in jobs):
-        components.html(
-            "<script>setTimeout(() => window.parent.location.reload(), 10000);</script>",
-            height=0,
-        )
-
     cols = st.columns([1, 4])
     with cols[0]:
         st.button("刷新任务状态", use_container_width=True)
     with cols[1]:
         st.subheader("后台任务")
+        st.caption("页面不会自动刷新。需要看最新进度时，点左侧刷新按钮即可。")
 
     for index, job in enumerate(jobs, start=1):
         title = (
@@ -1614,19 +1809,36 @@ def render_jobs():
             f"{job.get('message', '')}"
         )
         with st.expander(title, expanded=index == 1):
+            job_dir = Path(job.get("_job_dir", ""))
+            is_active = job.get("status") in {"排队中", "处理中", "正在停止"}
             progress_value = float(job.get("progress") or 0)
             st.progress(min(max(progress_value, 0.0), 1.0), text=job.get("message", ""))
-            cols = st.columns(5)
+            cols = st.columns(6)
             cols[0].metric("PDF", job.get("pdf_count", 0))
-            cols[1].metric("上传", job.get("success_count", job.get("upload_done", 0)))
-            cols[2].metric("跳过", job.get("skipped_count", 0))
-            cols[3].metric("异常", job.get("error_count", 0))
-            cols[4].metric("并发", job.get("upload_workers", UPLOAD_WORKERS))
+            cols[1].metric("成功上传", job.get("success_count", job.get("upload_success_count", 0)))
+            cols[2].metric("已尝试", job.get("upload_done", 0))
+            cols[3].metric("跳过", job.get("skipped_count", 0))
+            cols[4].metric("异常", job.get("error_count", job.get("upload_failed_count", 0)))
+            cols[5].metric("并发", job.get("upload_workers", UPLOAD_WORKERS))
+
+            if is_active and not job.get("cancel_requested"):
+                if st.button(
+                    "停止这个任务",
+                    type="secondary",
+                    use_container_width=True,
+                    key=f"cancel-job-{job.get('job_id', index)}",
+                ):
+                    request_job_cancel(job_dir)
+                    st.warning("已发出停止请求。当前正在上传的几个文件会先收尾，后面的不会继续上传。")
+                    st.rerun()
+            elif job.get("cancel_requested") and is_active:
+                st.warning("正在停止：等待当前上传请求收尾。")
 
             if job.get("status") == "失败":
                 st.error(job.get("error") or job.get("message"))
+            if job.get("last_upload_error"):
+                st.warning("最近一次上传失败：" + job.get("last_upload_error"))
 
-            job_dir = Path(job.get("_job_dir", ""))
             log_path = job_dir / "处理日志.xlsx"
             zip_path = job_dir / "本次生成PDF备份.zip"
             if log_path.exists():

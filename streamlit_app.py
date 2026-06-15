@@ -44,6 +44,7 @@ PROCESS_HISTORY_LIMIT = 3
 JOB_DIR = Path(os.environ.get("LABEL_TOOL_JOB_DIR", "/tmp/amazon_label_pdf_jobs"))
 JOB_HISTORY_LIMIT = 10
 UPLOAD_WORKERS = max(1, int(os.environ.get("LABEL_TOOL_UPLOAD_WORKERS", "5")))
+FEISHU_REQUEST_TIMEOUT = max(5, int(os.environ.get("LABEL_TOOL_FEISHU_TIMEOUT", "45")))
 
 LOCAL_ILLEGAL_FILENAME_CHARS = r'\/:*?"<>|'
 
@@ -447,14 +448,12 @@ def parse_index_sheets(sheet_values_list):
     if not used_sheet_names:
         raise FatalError("没有找到索引 Sheet：请确认至少一个 Sheet 第一行包含 FNSKU、SKU 等表头")
 
-    if missing_fnsku_rows:
-        raise FatalError(
-            "索引表中以下位置缺少必填 FNSKU："
-            + "、".join(missing_fnsku_rows[:30])
-            + ("、..." if len(missing_fnsku_rows) > 30 else "")
-        )
-
     warnings = []
+    if missing_fnsku_rows:
+        sample_text = "；".join(missing_fnsku_rows[:10])
+        if len(missing_fnsku_rows) > 10:
+            sample_text += "；..."
+        warnings.append(f"已忽略 {len(missing_fnsku_rows)} 行缺少 FNSKU 的半填写索引行（{sample_text}）")
     if invalid_fnsku_rows:
         sample_text = "；".join(f"{row_ref} {fnsku}" for row_ref, fnsku in invalid_fnsku_rows[:10])
         if len(invalid_fnsku_rows) > 10:
@@ -486,7 +485,7 @@ def parse_index_sheets(sheet_values_list):
 
 def urlopen_json(request):
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=FEISHU_REQUEST_TIMEOUT) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -1196,18 +1195,19 @@ def upload_pending_rows(
     def cancel_requested():
         return bool(cancel_callback and cancel_callback())
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_row = {}
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    future_to_row = {}
 
-        def submit_next():
-            nonlocal next_index
-            if next_index >= total:
-                return False
-            row = pending_rows[next_index]
-            next_index += 1
-            future_to_row[executor.submit(upload_one, row)] = row
-            return True
+    def submit_next():
+        nonlocal next_index
+        if next_index >= total:
+            return False
+        row = pending_rows[next_index]
+        next_index += 1
+        future_to_row[executor.submit(upload_one, row)] = row
+        return True
 
+    try:
         while next_index < total and len(future_to_row) < worker_count and not cancel_requested():
             submit_next()
 
@@ -1217,6 +1217,7 @@ def upload_pending_rows(
         while future_to_row:
             if cancel_requested():
                 cancelled = True
+                break
 
             done_futures, _ = wait(
                 future_to_row.keys(),
@@ -1272,16 +1273,27 @@ def upload_pending_rows(
                     )
 
             if cancelled:
-                continue
+                break
 
             while next_index < total and len(future_to_row) < worker_count and not cancel_requested():
                 submit_next()
 
         if cancel_requested():
             cancelled = True
+    finally:
+        executor.shutdown(wait=not cancelled, cancel_futures=True)
 
-    if cancelled and next_index < total:
-        for row in pending_rows[next_index:]:
+    if cancelled:
+        stopped_rows = []
+        seen_row_ids = set()
+        for row in list(future_to_row.values()) + pending_rows[next_index:]:
+            row_id = id(row)
+            if row_id in seen_row_ids:
+                continue
+            seen_row_ids.add(row_id)
+            stopped_rows.append(row)
+
+        for row in stopped_rows:
             mark_row_not_uploaded(row)
 
     if cancelled and status_callback:
@@ -1647,7 +1659,7 @@ def request_job_cancel(job_dir):
         job_dir,
         cancel_requested=True,
         status="正在停止",
-        message="已请求停止，正在等待当前上传收尾。",
+        message="已请求停止，正在结束任务，不会继续上传后续文件。",
     )
 
 

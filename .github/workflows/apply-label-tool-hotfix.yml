@@ -1,0 +1,219 @@
+name: Apply one-time label tool hotfix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/apply-label-tool-hotfix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch streamlit app
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('streamlit_app.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_missing = '''    if missing_fnsku_rows:\n        raise FatalError(\n            "索引表中以下位置缺少必填 FNSKU："\n            + "、".join(missing_fnsku_rows[:30])\n            + ("、..." if len(missing_fnsku_rows) > 30 else "")\n        )\n\n    warnings = []'''
+          new_missing = '''    warnings = []\n    if missing_fnsku_rows:\n        sample_text = "；".join(missing_fnsku_rows[:10])\n        if len(missing_fnsku_rows) > 10:\n            sample_text += "；..."\n        warnings.append(f"已忽略 {len(missing_fnsku_rows)} 行缺少 FNSKU 的半填写索引行（{sample_text}）")'''
+          text = text.replace(old_missing, new_missing)
+
+          text = text.replace(
+              'UPLOAD_WORKERS = max(1, int(os.environ.get("LABEL_TOOL_UPLOAD_WORKERS", "5")))\n',
+              'UPLOAD_WORKERS = max(1, int(os.environ.get("LABEL_TOOL_UPLOAD_WORKERS", "5")))\nFEISHU_REQUEST_TIMEOUT = max(5, int(os.environ.get("LABEL_TOOL_FEISHU_TIMEOUT", "45")))\n',
+          )
+          text = text.replace('urllib.request.urlopen(request, timeout=90)', 'urllib.request.urlopen(request, timeout=FEISHU_REQUEST_TIMEOUT)')
+          text = text.replace('message="已请求停止，正在等待当前上传收尾。"', 'message="已请求停止，正在结束任务，不会继续上传后续文件。"')
+
+          new_upload = r'''
+def upload_pending_rows(
+    log_rows,
+    feishu_token,
+    feishu_config,
+    remote_by_fnsku,
+    status_callback=None,
+    cancel_callback=None,
+):
+    pending_rows = [
+        row
+        for row in log_rows
+        if row.get("_needs_upload") and row.get("匹配状态") == SUCCESS_STATUS
+    ]
+    total = len(pending_rows)
+    if not pending_rows:
+        return {"total": 0, "done": 0, "success": 0, "failed": 0, "cancelled": False}
+
+    worker_count = min(UPLOAD_WORKERS, total)
+
+    def upload_one(row):
+        local_path = Path(row["_local_path"])
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                return feishu_upload_file(feishu_token, feishu_config, local_path, row["飞书正式文件名"])
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(attempt * 1.5)
+        raise last_error
+
+    done = 0
+    success_count = 0
+    failed_count = 0
+    next_index = 0
+    cancelled = False
+
+    def cancel_requested():
+        return bool(cancel_callback and cancel_callback())
+
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    future_to_row = {}
+
+    def submit_next():
+        nonlocal next_index
+        if next_index >= total:
+            return False
+        row = pending_rows[next_index]
+        next_index += 1
+        future_to_row[executor.submit(upload_one, row)] = row
+        return True
+
+    try:
+        while next_index < total and len(future_to_row) < worker_count and not cancel_requested():
+            submit_next()
+
+        if next_index == 0 and cancel_requested():
+            cancelled = True
+
+        while future_to_row:
+            if cancel_requested():
+                cancelled = True
+                break
+
+            done_futures, _ = wait(
+                future_to_row.keys(),
+                timeout=1,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done_futures:
+                continue
+
+            for future in done_futures:
+                row = future_to_row.pop(future)
+                done += 1
+                fnsku = row.get("识别FNSKU") or ""
+
+                try:
+                    file_token = future.result()
+                except Exception as exc:
+                    failed_count += 1
+                    row["匹配状态"] = "失败"
+                    row["失败原因"] = f"飞书上传失败：{exc}"
+                    row["飞书文件token"] = ""
+                    row["处理动作"] = "异常(飞书上传失败，未上传)"
+                    row["_needs_upload"] = False
+                    status_text = "上传失败"
+                    last_upload_error = f"{fnsku} 上传失败：{exc}"
+                else:
+                    success_count += 1
+                    row["飞书文件token"] = file_token
+                    row["处理动作"] = "生成修改后PDF；上传飞书"
+                    row["_needs_upload"] = False
+                    remote_by_fnsku[fnsku] = [
+                        {"name": row["飞书正式文件名"], "token": file_token, "type": "file"}
+                    ]
+                    status_text = "上传成功"
+                    last_upload_error = ""
+
+                if status_callback:
+                    status_callback(
+                        {
+                            "phase": "upload",
+                            "message": (
+                                f"正在并发上传到飞书：{done}/{total}，"
+                                f"成功 {success_count}，失败 {failed_count}，并发 {worker_count}，"
+                                f"{fnsku} {status_text}"
+                            ),
+                            "upload_done": done,
+                            "upload_total": total,
+                            "upload_success_count": success_count,
+                            "upload_failed_count": failed_count,
+                            "upload_workers": worker_count,
+                            "last_upload_error": last_upload_error,
+                        }
+                    )
+
+            if cancelled:
+                break
+
+            while next_index < total and len(future_to_row) < worker_count and not cancel_requested():
+                submit_next()
+
+        if cancel_requested():
+            cancelled = True
+    finally:
+        executor.shutdown(wait=not cancelled, cancel_futures=True)
+
+    if cancelled:
+        stopped_rows = []
+        seen_row_ids = set()
+        for row in list(future_to_row.values()) + pending_rows[next_index:]:
+            row_id = id(row)
+            if row_id in seen_row_ids:
+                continue
+            seen_row_ids.add(row_id)
+            stopped_rows.append(row)
+
+        for row in stopped_rows:
+            mark_row_not_uploaded(row)
+
+    if cancelled and status_callback:
+        status_callback(
+            {
+                "phase": "upload",
+                "message": (
+                    f"任务已停止：已尝试上传 {done}/{total}，"
+                    f"成功 {success_count}，失败 {failed_count}，剩余未上传。"
+                ),
+                "upload_done": done,
+                "upload_total": total,
+                "upload_success_count": success_count,
+                "upload_failed_count": failed_count,
+                "upload_workers": worker_count,
+                "cancelled": True,
+            }
+        )
+
+    return {
+        "total": total,
+        "done": done,
+        "success": success_count,
+        "failed": failed_count,
+        "cancelled": cancelled,
+    }
+'''
+          start = text.index('\ndef upload_pending_rows(')
+          end = text.index('\n\ndef process_saved_pdfs(', start)
+          text = text[:start] + new_upload + text[end:]
+
+          path.write_text(text, encoding='utf-8')
+          PY
+      - name: Remove one-time workflow
+        run: rm -f .github/workflows/apply-label-tool-hotfix.yml
+      - name: Commit patched app
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add streamlit_app.py .github/workflows/apply-label-tool-hotfix.yml
+          git diff --cached --quiet && exit 0
+          git commit -m "Fix label index validation and stop handling"
+          git push

@@ -136,7 +136,7 @@ def ensure_pdf_suffix(filename):
 def normalize_display_filename(filename):
     filename = cell_to_text(filename)
     filename = re.sub(r"[\r\n\t]+", " ", filename)
-    filename = re.sub(r"\s+", "-", filename)
+    filename = re.sub(r" {2,}", " ", filename)
     filename = filename.strip(" .-")
     if not filename:
         raise FileNameError("文件名为空")

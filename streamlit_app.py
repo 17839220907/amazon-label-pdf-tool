@@ -840,6 +840,24 @@ def feishu_delete_file(token, file_token, file_type="file"):
     )
 
 
+def delete_remote_file_records(token, files):
+    deleted = []
+    failed = []
+    seen_tokens = set()
+    for file_info in files:
+        file_token = cell_to_text(file_info.get("token"))
+        if not file_token or file_token in seen_tokens:
+            continue
+        seen_tokens.add(file_token)
+        try:
+            feishu_delete_file(token, file_token, file_info.get("type") or "file")
+        except Exception as exc:
+            failed.append((file_info, str(exc)))
+        else:
+            deleted.append(file_info)
+    return deleted, failed
+
+
 def build_remote_fnsku_map(remote_files):
     remote_by_fnsku = defaultdict(list)
     pattern = re.compile(FNSKU_REGEX, re.IGNORECASE)
@@ -882,7 +900,11 @@ def cleanup_remote_duplicates(token, remote_by_fnsku):
             continue
 
         unique_files.sort(
-            key=lambda item: (cell_to_text(item.get("timestamp")), cell_to_text(item.get("name"))),
+            key=lambda item: (
+                bool(item.get("_uploaded_this_run")),
+                cell_to_text(item.get("timestamp")),
+                cell_to_text(item.get("name")),
+            ),
             reverse=True,
         )
         keep_file = unique_files[0]
@@ -1128,7 +1150,7 @@ def process_pdf_page(
             return fail_row(source_name, "信息异常", recognized_fnsku, str(exc), page_number=page_number)
 
         old_files = remote_by_fnsku.get(recognized_fnsku, [])
-        if old_files:
+        if old_files and not delete_existing_same_fnsku:
             report_stage(f"{recognized_fnsku} 飞书已存在，跳过上传")
             old_file = old_files[0]
             return skip_row(
@@ -1142,6 +1164,9 @@ def process_pdf_page(
                 label_line1=label_line1,
                 label_line2=label_line2,
             )
+
+        if old_files:
+            report_stage(f"{recognized_fnsku} 飞书已存在，将在新标签上传成功后替换旧标签")
 
         report_stage(f"{recognized_fnsku} 正在生成新标签 PDF")
         local_path = unique_path(output_dir, local_filename)
@@ -1173,6 +1198,7 @@ def process_pdf_page(
         row["_local_path"] = str(local_path)
         row["_needs_upload"] = True
         row["_索引Sheet"] = index_row.get("_索引Sheet", "")
+        row["_old_remote_files"] = [dict(file_info) for file_info in old_files]
 
         if defer_upload:
             return row
@@ -1185,15 +1211,22 @@ def process_pdf_page(
             display_filename,
         )
         row["飞书文件token"] = feishu_file_token
-        row["处理动作"] = f"{action}；上传飞书"
-        remote_by_fnsku[recognized_fnsku] = [
-            {
-                "name": display_filename,
-                "token": feishu_file_token,
-                "type": "file",
-                "parent_token": feishu_config["output_root_folder_token"],
-            }
-        ]
+        new_file = {
+            "name": display_filename,
+            "token": feishu_file_token,
+            "type": "file",
+            "parent_token": feishu_config["output_root_folder_token"],
+            "_uploaded_this_run": True,
+        }
+        deleted_old, failed_old = delete_remote_file_records(feishu_token, old_files)
+        if failed_old:
+            row["失败原因"] = f"新标签已上传，但有 {len(failed_old)} 个旧标签暂未删除，程序稍后会再次清理"
+            row["处理动作"] = f"{action}；上传飞书；旧标签待清理 {len(failed_old)} 个"
+        elif deleted_old:
+            row["处理动作"] = f"{action}；上传飞书；替换飞书旧标签 {len(deleted_old)} 个"
+        else:
+            row["处理动作"] = f"{action}；上传飞书"
+        remote_by_fnsku[recognized_fnsku] = [new_file] + [file_info for file_info, _ in failed_old]
         row["_needs_upload"] = False
         delete_file_quietly(local_path)
         return row
@@ -1415,17 +1448,28 @@ def upload_pending_rows(
                 else:
                     success_count += 1
                     row["飞书文件token"] = file_token
-                    row["处理动作"] = "生成修改后PDF；上传飞书"
                     row["_needs_upload"] = False
                     delete_file_quietly(row.get("_local_path"))
-                    remote_by_fnsku[fnsku] = [
-                        {
-                            "name": row["飞书正式文件名"],
-                            "token": file_token,
-                            "type": "file",
-                            "parent_token": row.get("_upload_folder_token", ""),
-                        }
-                    ]
+                    new_file = {
+                        "name": row["飞书正式文件名"],
+                        "token": file_token,
+                        "type": "file",
+                        "parent_token": row.get("_upload_folder_token", ""),
+                        "_uploaded_this_run": True,
+                    }
+                    old_files = row.get("_old_remote_files") or []
+                    deleted_old, failed_old = delete_remote_file_records(feishu_token, old_files)
+                    if failed_old:
+                        row["失败原因"] = (
+                            f"新标签已上传，但有 {len(failed_old)} 个旧标签暂未删除，"
+                            "程序稍后会再次清理"
+                        )
+                        row["处理动作"] = f"生成修改后PDF；上传飞书；旧标签待清理 {len(failed_old)} 个"
+                    elif deleted_old:
+                        row["处理动作"] = f"生成修改后PDF；上传飞书；替换飞书旧标签 {len(deleted_old)} 个"
+                    else:
+                        row["处理动作"] = "生成修改后PDF；上传飞书"
+                    remote_by_fnsku[fnsku] = [new_file] + [file_info for file_info, _ in failed_old]
                     status_text = "上传成功"
                     last_upload_error = ""
 
@@ -1500,7 +1544,7 @@ def upload_pending_rows(
 def process_saved_pdfs(
     saved_pdfs,
     output_dir,
-    delete_existing_same_fnsku=True,
+    delete_existing_same_fnsku=False,
     status_callback=None,
     cancel_callback=None,
 ):
@@ -1529,6 +1573,8 @@ def process_saved_pdfs(
     folder_tree = feishu_scan_folder_tree(feishu_token, root_folder_token)
     remote_files = folder_tree["all_items"]
     remote_by_fnsku = build_remote_fnsku_map(remote_files)
+    existing_mode_text = "覆盖已有标签" if delete_existing_same_fnsku else "跳过已有标签"
+    report(f"已有同 FNSKU 时：{existing_mode_text}", 0.13)
 
     saved_pdfs = sorted(saved_pdfs, key=lambda item: natural_sort_key(item[0]))
 
@@ -1720,7 +1766,7 @@ def save_uploaded_files_to_dir(pdf_files, input_dir):
     return sorted(saved_pdfs, key=lambda item: natural_sort_key(item[0]))
 
 
-def process_uploads(pdf_files, delete_existing_same_fnsku=True):
+def process_uploads(pdf_files, delete_existing_same_fnsku=False):
     status_box = st.empty()
     progress = st.progress(0, text="准备开始...")
 
@@ -1884,7 +1930,7 @@ def prune_job_history():
         shutil.rmtree(old_dir, ignore_errors=True)
 
 
-def create_processing_job(pdf_files):
+def create_processing_job(pdf_files, delete_existing_same_fnsku=False):
     JOB_DIR.mkdir(parents=True, exist_ok=True)
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     job_dir = JOB_DIR / job_id
@@ -1906,6 +1952,8 @@ def create_processing_job(pdf_files):
         "progress": 0.0,
         "pdf_count": len(saved_pdfs),
         "upload_workers": UPLOAD_WORKERS,
+        "delete_existing_same_fnsku": bool(delete_existing_same_fnsku),
+        "existing_fnsku_mode": "覆盖已有标签" if delete_existing_same_fnsku else "跳过已有标签",
         "cancel_requested": False,
     }
     write_json_file(job_metadata_path(job_dir), metadata)
@@ -1919,8 +1967,10 @@ def create_processing_job(pdf_files):
 def run_processing_job(job_id):
     job_dir = JOB_DIR / job_id
     output_dir = job_dir / "output"
+    job_metadata = read_json_file(job_metadata_path(job_dir), {}) or {}
     file_records = read_json_file(job_dir / "files.json", []) or []
     saved_pdfs = [(record["source_name"], Path(record["path"])) for record in file_records]
+    delete_existing_same_fnsku = bool(job_metadata.get("delete_existing_same_fnsku", False))
 
     def status_callback(payload):
         allowed_keys = {
@@ -1954,6 +2004,7 @@ def run_processing_job(job_id):
         result = process_saved_pdfs(
             saved_pdfs,
             output_dir,
+            delete_existing_same_fnsku=delete_existing_same_fnsku,
             status_callback=status_callback,
             cancel_callback=lambda: is_job_cancel_requested(job_dir),
         )
@@ -2040,6 +2091,7 @@ def render_jobs():
             is_active = job.get("status") in {"排队中", "处理中", "正在停止"}
             progress_value = safe_float(job.get("progress"), 0.0)
             st.progress(min(max(progress_value, 0.0), 1.0), text=job.get("message", ""))
+            st.caption("已有同 FNSKU 时：" + job.get("existing_fnsku_mode", "跳过已有标签"))
             cols = st.columns(6)
             cols[0].metric("PDF", job.get("pdf_count", 0))
             cols[1].metric("成功上传", job.get("success_count", job.get("upload_success_count", 0)))
@@ -2201,13 +2253,28 @@ def main():
         accept_multiple_files=True,
     )
 
+    existing_fnsku_mode = st.radio(
+        "飞书已有相同 FNSKU 时",
+        options=["跳过已有标签", "覆盖已有标签"],
+        horizontal=True,
+    )
+    delete_existing_same_fnsku = existing_fnsku_mode == "覆盖已有标签"
+    if delete_existing_same_fnsku:
+        st.warning("覆盖模式：新标签上传成功后，程序会删除飞书中的旧标签。")
+
     can_process = bool(pdf_files)
     if st.button("提交后台处理任务", type="primary", disabled=not can_process, use_container_width=True):
         try:
             with st.spinner("正在提交任务，请稍等..."):
-                job = create_processing_job(pdf_files)
+                job = create_processing_job(
+                    pdf_files,
+                    delete_existing_same_fnsku=delete_existing_same_fnsku,
+                )
                 st.session_state["last_job_id"] = job["job_id"]
-            st.success(f"任务已提交：{job['job_id']}。可以关闭页面，之后回来刷新查看结果。")
+            st.success(
+                f"任务已提交：{job['job_id']}，处理方式：{existing_fnsku_mode}。"
+                "可以关闭页面，之后回来刷新查看结果。"
+            )
         except FatalError as exc:
             st.error(f"启动失败：{exc}")
         except FeishuError as exc:
